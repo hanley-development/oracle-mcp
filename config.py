@@ -3,47 +3,52 @@ Configuration — edit this file with your environment details.
 """
 
 import os
-from pathlib import Path
 
 
 class Config:
-    # ── OCI ────────────────────────────────────────────────────────────────────
-    OCI_PROFILE: str = "OCI01"
+    # ── Tunnel mode ─────────────────────────────────────────────────────────────
+    # "manual" — run your ossh command yourself before calling connect.
+    #            The MCP server will simply verify localhost:LOCAL_TUNNEL_PORT
+    #            is reachable before connecting.
+    #
+    # "auto"   — the MCP server will spawn the ossh command for you on connect
+    #            and kill it on disconnect.
+    TUNNEL_MODE: str = os.getenv("TUNNEL_MODE", "manual")
 
-    # OCID of your OCI Bastion resource (not the session — the Bastion itself)
-    # Found in OCI Console → Bastion → copy OCID
-    BASTION_OCID: str = os.getenv("BASTION_OCID", "ocid1.bastion.oc1..<your-bastion-ocid>")
+    # ── ossh tunnel parameters (used in "auto" mode only) ───────────────────────
+    OCI_REGION: str = os.getenv("OCI_REGION", "us-ashburn-1")
 
-    # ── SSH Keys ────────────────────────────────────────────────────────────────
-    # Path to SSH private key for bastion session auth.
-    # If you leave these as-is, an ephemeral key pair will be auto-generated
-    # in C:\scripts\ on first run.
-    SSH_PRIVATE_KEY_PATH: str = os.getenv(
-        "SSH_PRIVATE_KEY_PATH",
-        str(Path(r"C:\scripts\mcp_bastion_key"))
-    )
-    SSH_PUBLIC_KEY_PATH: str = os.getenv(
-        "SSH_PUBLIC_KEY_PATH",
-        str(Path(r"C:\scripts\mcp_bastion_key.pub"))
-    )
+    # Compartment OCID — from your ossh command --compartment argument
+    COMPARTMENT_OCID: str = os.getenv("COMPARTMENT_OCID", "ocid1.compartment.oc1..<your-compartment-ocid>")
+
+    # Bastion session OCID — the static value after "proxy:" in your -s argument
+    # e.g. ocid1.bastion.oc1.iad.<key>
+    BASTION_SESSION_OCID: str = os.getenv("BASTION_SESSION_OCID", "ocid1.bastion.oc1.iad.<your-session-ocid>")
+
+    # ADB private IP — the 192.168.x.x address in your ossh command
+    ADB_PRIVATE_IP: str = os.getenv("ADB_PRIVATE_IP", "192.168.111.2")
+
+    # ADB hostname for the -L tunnel target
+    # e.g. ocidwdata.adb.us-ashburn-1.oraclecloud.com
+    ADB_HOSTNAME: str = os.getenv("ADB_HOSTNAME", "<your-adb-hostname>.adb.us-ashburn-1.oraclecloud.com")
+
+    # Port on the ADB side (almost always 1522 for ADB)
+    ADB_PORT: int = int(os.getenv("ADB_PORT", "1522"))
 
     # ── Wallet ──────────────────────────────────────────────────────────────────
     WALLET_ZIP_PATH: str = os.getenv("WALLET_ZIP_PATH", r"C:\scripts\oci_01.zip")
 
-    # Leave empty string if your wallet is not password-protected
+    # Leave as empty string if your wallet was not downloaded with a password
     WALLET_PASSWORD: str = os.getenv("WALLET_PASSWORD", "")
 
     # ── Oracle ADB ──────────────────────────────────────────────────────────────
-    # Service name from tnsnames.ora — typically looks like:
-    # <db_name>_high, <db_name>_medium, <db_name>_low, <db_name>_tp, <db_name>_tpurgent
+    # Service name — look inside oci_01.zip → tnsnames.ora for the entry names
+    # e.g. mydb_medium, mydb_high, mydb_tp
     ADB_SERVICE_NAME: str = os.getenv("ADB_SERVICE_NAME", "<your_db_name>_medium")
 
     DB_USERNAME: str = os.getenv("DB_USERNAME", "<your_db_username>")
     DB_PASSWORD: str = os.getenv("DB_PASSWORD", "<your_db_password>")
 
-    # ── Tunnel ──────────────────────────────────────────────────────────────────
-    # Local port to forward ADB traffic through. Change if 1522 is in use.
+    # ── Local tunnel port ────────────────────────────────────────────────────────
+    # Must match the port in your ossh -L argument (1522 by default)
     LOCAL_TUNNEL_PORT: int = int(os.getenv("LOCAL_TUNNEL_PORT", "1522"))
-
-    # Bastion session lifetime in seconds (max 10800 = 3 hours)
-    SESSION_TTL_SECONDS: int = int(os.getenv("SESSION_TTL_SECONDS", "7200"))

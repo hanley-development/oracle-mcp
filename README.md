@@ -1,143 +1,144 @@
 # Oracle ADB MCP Server — Setup Guide
 
+## How the tunnel works
+
+This server connects to Oracle ADB through your existing `ossh` tunnel.
+Two modes are supported — pick whichever suits your workflow:
+
+| Mode | What you do | What the server does |
+|---|---|---|
+| **manual** (default) | Run your `ossh` command in a terminal before calling `connect` | Checks `localhost:1522` is reachable, then connects |
+| **auto** | Nothing — just call `connect` | Spawns the `ossh` command itself, then connects, kills it on disconnect |
+
+Your ossh command (for reference):
+```
+ssh -o 'ProxyCommand=ossh proxy -V -U%r --overlay-bastion --region us-ashburn-1
+  --compartment <ocid.compartment> -- ssh stb-internal.bastion<region>.oci.oracleiaas.com
+  -p 22 -A -s proxy:ocid.bastion.oc1.iad.<key> 192.168.111.2
+  -L 1522:ocidwdata.adb.<region>.oraclecloud.com:1522
+  -t watch -n 90 date'
+```
+
+---
+
 ## Prerequisites
-- Python 3.11+ (you have 3.14 ✅)
-- OCI CLI config at `C:\Users\<user>\.oci\config` with `OCI01` profile ✅
+- Python 3.11+ ✅ (you have 3.14)
+- `ossh` in your system PATH ✅
 - Wallet zip at `C:\scripts\oci_01.zip` ✅
-- OpenSSH available (built into Windows 10/11) ✅
 
 ---
 
 ## Step 1 — Install dependencies
 
-Open a terminal (PowerShell or CMD) and run:
+Open PowerShell and run:
 
 ```powershell
 cd C:\scripts
 python -m venv mcp-oracle-env
 mcp-oracle-env\Scripts\activate
-pip install -r requirements.txt
+pip install -r oracle-mcp\requirements.txt
 ```
 
 ---
 
 ## Step 2 — Edit config.py
 
-Open `config.py` and fill in the blanks:
+Open `C:\scripts\oracle-mcp\config.py` and fill in:
 
 ```python
-# Your OCI Bastion OCID — found in OCI Console → Identity & Security → Bastion
-# Click your Bastion → copy the OCID at the top
-BASTION_OCID = "ocid1.bastion.oc1..<the-rest>"
+# "manual" or "auto" — see table above
+TUNNEL_MODE = "manual"
 
-# Your ADB service name — open C:\scripts\oci_01.zip and look at tnsnames.ora
-# Pick one of the entries e.g. mydb_medium, mydb_high, mydb_tp
-ADB_SERVICE_NAME = "mydb_medium"
+# Only needed if TUNNEL_MODE = "auto"
+OCI_REGION          = "us-ashburn-1"
+COMPARTMENT_OCID    = "ocid1.compartment.oc1..<your-compartment-ocid>"
+BASTION_SESSION_OCID = "ocid1.bastion.oc1.iad.<your-static-session-key>"
+ADB_PRIVATE_IP      = "192.168.111.2"
+ADB_HOSTNAME        = "<your-adb-hostname>.adb.us-ashburn-1.oraclecloud.com"
 
-# DB credentials
-DB_USERNAME = "ADMIN"           # or your app schema user
-DB_PASSWORD = "YourPassword123"
+# Always required
+ADB_SERVICE_NAME = "<your_db_name>_medium"   # see Step 3 below
+DB_USERNAME      = "<your_db_username>"
+DB_PASSWORD      = "<your_db_password>"
 
-# Wallet password — check if your wallet zip was downloaded with a password
-# In OCI Console → Autonomous Database → DB Connection → Download Wallet
-# If you set a password when downloading, put it here. Otherwise leave ""
-WALLET_PASSWORD = ""
+# Leave as "" if you didn't set a password when downloading the wallet
+WALLET_PASSWORD  = ""
 ```
 
-> **SSH Keys:** Leave `SSH_PRIVATE_KEY_PATH` and `SSH_PUBLIC_KEY_PATH` as-is.
-> The server will auto-generate an ephemeral key pair at `C:\scripts\mcp_bastion_key`
-> on first run. You don't need to create these manually.
-
 ---
 
-## Step 3 — Find your Bastion OCID
+## Step 3 — Find your ADB service name
 
-1. Go to [cloud.oracle.com](https://cloud.oracle.com) and sign in with your tenancy
-2. Navigate to: **Identity & Security → Bastion**
-3. Click your Bastion resource
-4. Copy the **OCID** from the top of the page — it starts with `ocid1.bastion.oc1...`
-
----
-
-## Step 4 — Find your ADB service name
-
-The service names are inside your wallet zip. To check:
+The service name is inside your wallet zip:
 
 ```powershell
-# List contents of wallet
 Expand-Archive C:\scripts\oci_01.zip -DestinationPath C:\scripts\wallet_preview -Force
 type C:\scripts\wallet_preview\tnsnames.ora
 ```
 
-You'll see entries like:
-```
-mydb_high = (DESCRIPTION=...
-mydb_medium = (DESCRIPTION=...
-mydb_low = (DESCRIPTION=...
-```
-
-Use `mydb_medium` for general queries (good balance of speed and concurrency).
+You'll see entries like `mydb_high`, `mydb_medium`, `mydb_low`, `mydb_tp`.
+Use `mydb_medium` for general use — good balance of speed and concurrency.
 
 ---
 
-## Step 5 — Register with Claude Desktop
+## Step 4 — Register with Cline (VS Code)
 
-Find your Claude Desktop config file:
-```
-C:\Users\mh026488\AppData\Roaming\Claude\claude_desktop_config.json
-```
-
-Add this to the `mcpServers` section:
+1. Open VS Code with the Cline extension installed
+2. Click the Cline icon in the sidebar → **MCP Servers** → **Edit Config**
+3. Add the following:
 
 ```json
 {
   "mcpServers": {
     "oracle-adb": {
       "command": "C:\\scripts\\mcp-oracle-env\\Scripts\\python.exe",
-      "args": ["C:\\scripts\\oracle-mcp\\server.py"],
-      "env": {}
+      "args": ["C:\\scripts\\oracle-mcp\\server.py"]
     }
   }
 }
 ```
 
-If the file doesn't exist yet, create it with:
-```json
-{
-  "mcpServers": {
-    "oracle-adb": {
-      "command": "C:\\scripts\\mcp-oracle-env\\Scripts\\python.exe",
-      "args": ["C:\\scripts\\oracle-mcp\\server.py"],
-      "env": {}
-    }
-  }
-}
-```
+4. Save the file — Cline will pick up the server automatically.
+
+> **Also works with Claude Desktop.** Config file is at:
+> `C:\Users\mh026488\AppData\Roaming\Claude\claude_desktop_config.json`
+> Use the same JSON block above.
 
 ---
 
-## Step 6 — Restart Claude Desktop
+## Step 5 — Connect and use
 
-Close and reopen Claude Desktop. You should see the oracle-adb tools available.
+### Manual tunnel mode (default)
+
+1. Open a PowerShell terminal and run your ossh command — leave it running
+2. In Cline, say: `Connect to the Oracle database`
+3. The server verifies the tunnel is up and connects
+
+### Auto tunnel mode
+
+1. Set `TUNNEL_MODE = "auto"` in config.py
+2. In Cline, say: `Connect to the Oracle database`
+3. The server launches ossh, waits for the tunnel, then connects
+4. When you say `disconnect`, the tunnel is killed cleanly
 
 ---
 
-## Step 7 — Test it
-
-In Claude Desktop, try:
+## Example prompts once connected
 
 ```
-Connect to the Oracle database using the OCI01 profile
+Show me all tables starting with AP_
 ```
-
-Then:
 ```
-Show me the schema for tables starting with HR_
+Generate an ERD for the AP invoicing tables
 ```
-
-Then:
 ```
-Generate an ERD for these tables: EMPLOYEES, DEPARTMENTS, LOCATIONS, JOBS, JOB_HISTORY
+Explain the AP_INVOICES table — row count, columns, sample data
+```
+```
+Search for all columns containing EMPLOYEE across the schema
+```
+```
+Query the top 10 suppliers by invoice count
 ```
 
 ---
@@ -146,21 +147,22 @@ Generate an ERD for these tables: EMPLOYEES, DEPARTMENTS, LOCATIONS, JOBS, JOB_H
 
 | Problem | Fix |
 |---|---|
-| `Bastion session FAILED` | Check BASTION_OCID is correct and your OCI user has `manage bastion-session` permission |
-| `SSH tunnel not ready` | Ensure OpenSSH is installed: run `ssh -V` in PowerShell |
+| `No listener on localhost:1522` | You're in manual mode but haven't run your ossh command yet |
+| `ossh tunnel exited unexpectedly` | Check BASTION_SESSION_OCID and COMPARTMENT_OCID in config.py match your command |
 | `ORA-01017 invalid credentials` | Check DB_USERNAME / DB_PASSWORD in config.py |
-| `Wallet error` | Ensure WALLET_ZIP_PATH points to the correct zip and WALLET_PASSWORD matches what you set when downloading |
-| `Connection timed out` | Check the ADB private endpoint is reachable from the Bastion subnet |
+| `Wallet error / SSL error` | Verify WALLET_ZIP_PATH is `C:\scripts\oci_01.zip` and WALLET_PASSWORD is correct |
+| `Service name not found` | Check ADB_SERVICE_NAME matches an entry in tnsnames.ora (Step 3) |
+| Tunnel drops after a while | Normal — the `watch -n 90 date` keepalive in your ossh command handles this; in auto mode it's included automatically |
 
 ---
 
-## File Layout
+## File layout
 
 ```
 C:\scripts\
 ├── oracle-mcp\
 │   ├── server.py          # MCP entrypoint
-│   ├── connection.py      # OCI + SSH + wallet
+│   ├── connection.py      # ossh tunnel + wallet + DB connection
 │   ├── schema.py          # Table/column introspection
 │   ├── relationships.py   # Heuristic FK inference
 │   ├── diagram.py         # Mermaid ERD generation

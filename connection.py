@@ -1,16 +1,23 @@
 """
 Connection Manager
-Handles: OCI API auth → Bastion session creation → SSH tunnel → ADB wallet connection
+Supports two tunnel modes (set TUNNEL_MODE in config.py):
+
+  "manual" — you run the ossh command yourself before calling connect.
+             The server just connects to localhost:LOCAL_TUNNEL_PORT.
+
+  "auto"   — the server spawns the ossh command for you on connect,
+             then connects to localhost:LOCAL_TUNNEL_PORT.
 """
 
 import os
-import time
 import asyncio
 import logging
 import zipfile
 import tempfile
 import subprocess
-import oci
+import socket
+import shutil
+import re
 import oracledb
 from pathlib import Path
 from config import Config
@@ -23,8 +30,6 @@ class ConnectionManager:
         self.config = Config()
         self.connection = None
         self.tunnel_process = None
-        self.bastion_client = None
-        self.session_id = None
         self.wallet_dir = None
         self._schema = None
 
@@ -41,152 +46,74 @@ class ConnectionManager:
         try:
             self._schema = schema
 
-            # Step 1: OCI SDK auth
-            logger.info("Authenticating with OCI...")
-            oci_config = oci.config.from_file(
-                file_location=str(Path.home() / ".oci" / "config"),
-                profile_name=self.config.OCI_PROFILE
-            )
-            oci.config.validate_config(oci_config)
-            self.bastion_client = oci.bastion.BastionClient(oci_config)
-
-            # Step 2: Extract wallet
+            # Step 1: Extract wallet to temp dir
             logger.info("Extracting wallet...")
             self.wallet_dir = tempfile.mkdtemp(prefix="oracle_wallet_")
-            with zipfile.ZipFile(self.config.WALLET_ZIP_PATH, 'r') as zf:
+            with zipfile.ZipFile(self.config.WALLET_ZIP_PATH, "r") as zf:
                 zf.extractall(self.wallet_dir)
             self._patch_sqlnet_ora()
 
-            # Step 3: Create bastion session
-            logger.info("Creating OCI Bastion session...")
-            session_id, tunnel_host, tunnel_port = await self._create_bastion_session(oci_config)
-            self.session_id = session_id
+            # Step 2: Tunnel — auto-spawn or verify manual
+            if self.config.TUNNEL_MODE == "auto":
+                logger.info("Spawning ossh tunnel...")
+                await self._spawn_ossh_tunnel()
+                tunnel_note = "tunnel opened automatically via ossh"
+            else:
+                logger.info("Manual mode — verifying tunnel on localhost...")
+                self._assert_tunnel_reachable()
+                tunnel_note = "using pre-existing tunnel on localhost"
 
-            # Step 4: Open SSH tunnel
-            logger.info("Opening SSH tunnel...")
-            local_port = self.config.LOCAL_TUNNEL_PORT
-            await self._open_ssh_tunnel(tunnel_host, tunnel_port, local_port, oci_config)
-
-            # Step 5: Connect to ADB
+            # Step 3: Connect to ADB
             logger.info("Connecting to Oracle ADB...")
-            self.connection = self._create_db_connection(local_port)
+            self.connection = self._create_db_connection()
 
             schema_info = f" (schema: {self._schema})" if self._schema else ""
-            return f"✅ Connected to Oracle ADB{schema_info} via OCI Bastion tunnel. Ready to inspect schema."
+            return (
+                f"✅ Connected to Oracle ADB{schema_info}. "
+                f"Tunnel mode: {tunnel_note}. Ready to inspect schema."
+            )
 
         except Exception as e:
             await self._cleanup()
             raise RuntimeError(f"Connection failed: {e}") from e
 
+    # ── Wallet ─────────────────────────────────────────────────────────────────
+
     def _patch_sqlnet_ora(self):
-        """Update sqlnet.ora wallet path to the extracted temp directory."""
+        """Rewrite wallet path in sqlnet.ora to the extracted temp dir."""
         sqlnet_path = os.path.join(self.wallet_dir, "sqlnet.ora")
-        if os.path.exists(sqlnet_path):
-            with open(sqlnet_path, "r") as f:
-                content = f.read()
-            # Replace placeholder wallet location with actual temp path
-            import re
-            content = re.sub(
-                r'DIRECTORY="[^"]*"',
-                f'DIRECTORY="{self.wallet_dir}"',
-                content
-            )
-            with open(sqlnet_path, "w") as f:
-                f.write(content)
-
-    async def _create_bastion_session(self, oci_config: dict):
-        """Create a managed SSH port forwarding session via OCI Bastion API."""
-        import oci.bastion.models as bm
-
-        # Read the SSH public key to use for the ephemeral session
-        pub_key_path = Path(self.config.SSH_PUBLIC_KEY_PATH)
-        if not pub_key_path.exists():
-            # Generate an ephemeral key pair if none provided
-            await self._generate_ephemeral_keypair()
-            pub_key_path = Path(self.config.SSH_PUBLIC_KEY_PATH)
-
-        with open(pub_key_path) as f:
-            public_key = f.read().strip()
-
-        # Parse the ADB private endpoint host/port from tnsnames.ora
-        adb_host, adb_port = self._parse_adb_endpoint()
-
-        session_details = bm.CreateSessionDetails(
-            bastion_id=self.config.BASTION_OCID,
-            display_name="mcp-oracle-session",
-            key_details=bm.PublicKeyDetails(public_key_content=public_key),
-            target_resource_details=bm.CreatePortForwardingSessionTargetResourceDetails(
-                session_type="PORT_FORWARDING",
-                target_resource_private_ip_address=adb_host,
-                target_resource_port=adb_port
-            ),
-            session_ttl_in_seconds=self.config.SESSION_TTL_SECONDS
-        )
-
-        response = self.bastion_client.create_session(
-            create_session_details=session_details
-        )
-        session_id = response.data.id
-
-        # Poll until session is ACTIVE
-        logger.info(f"Waiting for bastion session {session_id} to become active...")
-        for _ in range(30):
-            session = self.bastion_client.get_session(session_id).data
-            if session.lifecycle_state == "ACTIVE":
-                logger.info("Bastion session is ACTIVE")
-                ssh_metadata = session.ssh_metadata
-                return session_id, ssh_metadata.proxy_jump, ssh_metadata.target_resource_port
-            elif session.lifecycle_state in ("FAILED", "DELETED"):
-                raise RuntimeError(f"Bastion session entered state: {session.lifecycle_state}")
-            await asyncio.sleep(5)
-
-        raise RuntimeError("Timed out waiting for bastion session to become ACTIVE")
-
-    async def _generate_ephemeral_keypair(self):
-        """Generate a temporary RSA key pair for the bastion session."""
-        key_path = self.config.SSH_PRIVATE_KEY_PATH
-        pub_path = self.config.SSH_PUBLIC_KEY_PATH
-        proc = await asyncio.create_subprocess_exec(
-            "ssh-keygen", "-t", "rsa", "-b", "2048",
-            "-f", key_path, "-N", "", "-q",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-        await proc.wait()
-        logger.info(f"Generated ephemeral SSH key pair at {key_path}")
-
-    def _parse_adb_endpoint(self):
-        """Extract private endpoint host and port from tnsnames.ora."""
-        tns_path = os.path.join(self.wallet_dir, "tnsnames.ora")
-        with open(tns_path) as f:
+        if not os.path.exists(sqlnet_path):
+            return
+        with open(sqlnet_path, "r") as f:
             content = f.read()
+        content = re.sub(
+            r'DIRECTORY="[^"]*"',
+            f'DIRECTORY="{self.wallet_dir}"',
+            content
+        )
+        with open(sqlnet_path, "w") as f:
+            f.write(content)
 
-        import re
-        # Match HOST and PORT in tnsnames.ora
-        host_match = re.search(r'HOST\s*=\s*([\w\.\-]+)', content, re.IGNORECASE)
-        port_match = re.search(r'PORT\s*=\s*(\d+)', content, re.IGNORECASE)
+    # ── Tunnel: auto mode ──────────────────────────────────────────────────────
 
-        if not host_match or not port_match:
-            raise ValueError("Could not parse HOST/PORT from tnsnames.ora")
-
-        return host_match.group(1), int(port_match.group(1))
-
-    async def _open_ssh_tunnel(self, tunnel_host: str, tunnel_port: int, local_port: int, oci_config: dict):
-        """Open SSH port-forwarding tunnel through OCI Bastion."""
-        adb_host, adb_port = self._parse_adb_endpoint()
-        private_key = self.config.SSH_PRIVATE_KEY_PATH
-
+    async def _spawn_ossh_tunnel(self):
+        """Launch the ossh tunnel as a background subprocess."""
+        cfg = self.config
         cmd = [
-            "ssh",
-            "-i", private_key,
-            "-N",                           # No command, just tunnel
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
-            "-o", "ExitOnForwardFailure=yes",
-            "-L", f"{local_port}:{adb_host}:{adb_port}",
-            f"{self.session_id}@{tunnel_host}",
-            "-p", str(tunnel_port)
+            "ossh", "proxy",
+            "-V",
+            f"-U{cfg.DB_USERNAME}",
+            "--overlay-bastion",
+            "--region", cfg.OCI_REGION,
+            "--compartment", cfg.COMPARTMENT_OCID,
+            "--", "ssh",
+            f"stb-internal.bastion{cfg.OCI_REGION}.oci.oracleiaas.com",
+            "-p", "22",
+            "-A",
+            "-s", f"proxy:{cfg.BASTION_SESSION_OCID}",
+            cfg.ADB_PRIVATE_IP,
+            "-L", f"{cfg.LOCAL_TUNNEL_PORT}:{cfg.ADB_HOSTNAME}:{cfg.ADB_PORT}",
+            "-t", "watch", "-n", "90", "date"
         ]
 
         self.tunnel_process = subprocess.Popen(
@@ -195,35 +122,60 @@ class ConnectionManager:
             stderr=subprocess.DEVNULL
         )
 
-        # Wait for tunnel to be ready
-        for _ in range(20):
+        # Wait up to 30s for the local port to open
+        for _ in range(30):
             await asyncio.sleep(1)
             if self.tunnel_process.poll() is not None:
-                raise RuntimeError("SSH tunnel process exited unexpectedly")
-            try:
-                import socket
-                with socket.create_connection(("127.0.0.1", local_port), timeout=1):
-                    logger.info(f"SSH tunnel ready on localhost:{local_port}")
-                    return
-            except (ConnectionRefusedError, OSError):
-                continue
+                raise RuntimeError(
+                    "ossh tunnel process exited unexpectedly. "
+                    "Check BASTION_SESSION_OCID and COMPARTMENT_OCID in config.py."
+                )
+            if self._port_open():
+                logger.info(f"Tunnel ready on localhost:{cfg.LOCAL_TUNNEL_PORT}")
+                return
 
-        raise RuntimeError("SSH tunnel did not become ready in time")
+        raise RuntimeError(
+            f"Tunnel did not open on localhost:{cfg.LOCAL_TUNNEL_PORT} within 30s."
+        )
 
-    def _create_db_connection(self, local_port: int):
-        """Connect to ADB using python-oracledb thin mode via tunnel + wallet."""
-        # Build DSN pointing to localhost tunnel
-        dsn = f"(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=127.0.0.1)(PORT={local_port}))(CONNECT_DATA=(SERVICE_NAME={self.config.ADB_SERVICE_NAME}))(SECURITY=(SSL_SERVER_DN_MATCH=yes)))"
+    # ── Tunnel: manual mode ────────────────────────────────────────────────────
 
-        conn = oracledb.connect(
+    def _assert_tunnel_reachable(self):
+        """Verify the manually-opened tunnel is listening before we try to connect."""
+        if not self._port_open():
+            raise RuntimeError(
+                f"No listener found on localhost:{self.config.LOCAL_TUNNEL_PORT}. "
+                f"Please run your ossh command first, then call connect again."
+            )
+
+    def _port_open(self) -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", self.config.LOCAL_TUNNEL_PORT), timeout=1):
+                return True
+        except (ConnectionRefusedError, OSError):
+            return False
+
+    # ── DB connection ──────────────────────────────────────────────────────────
+
+    def _create_db_connection(self):
+        """Connect via oracledb thin mode through the local tunnel + wallet."""
+        port = self.config.LOCAL_TUNNEL_PORT
+        dsn = (
+            f"(DESCRIPTION="
+            f"(ADDRESS=(PROTOCOL=TCPS)(HOST=127.0.0.1)(PORT={port}))"
+            f"(CONNECT_DATA=(SERVICE_NAME={self.config.ADB_SERVICE_NAME}))"
+            f"(SECURITY=(SSL_SERVER_DN_MATCH=yes)))"
+        )
+        return oracledb.connect(
             user=self.config.DB_USERNAME,
             password=self.config.DB_PASSWORD,
             dsn=dsn,
             config_dir=self.wallet_dir,
             wallet_location=self.wallet_dir,
-            wallet_password=self.config.WALLET_PASSWORD  # if wallet is password-protected
+            wallet_password=self.config.WALLET_PASSWORD
         )
-        return conn
+
+    # ── Accessors ──────────────────────────────────────────────────────────────
 
     def get_connection(self):
         return self.connection
@@ -231,9 +183,11 @@ class ConnectionManager:
     def get_schema(self):
         return self._schema
 
+    # ── Disconnect ─────────────────────────────────────────────────────────────
+
     async def disconnect(self) -> str:
         await self._cleanup()
-        return "✅ Disconnected from Oracle ADB and closed SSH tunnel."
+        return "✅ Disconnected from Oracle ADB and cleaned up tunnel/wallet."
 
     async def _cleanup(self):
         if self.connection:
@@ -245,17 +199,12 @@ class ConnectionManager:
 
         if self.tunnel_process:
             self.tunnel_process.terminate()
+            try:
+                self.tunnel_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.tunnel_process.kill()
             self.tunnel_process = None
 
-        if self.session_id and self.bastion_client:
-            try:
-                self.bastion_client.delete_session(self.session_id)
-                logger.info(f"Deleted bastion session {self.session_id}")
-            except Exception:
-                pass
-            self.session_id = None
-
         if self.wallet_dir and os.path.exists(self.wallet_dir):
-            import shutil
             shutil.rmtree(self.wallet_dir, ignore_errors=True)
             self.wallet_dir = None
