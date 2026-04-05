@@ -3,6 +3,9 @@ Oracle ADB MCP Server
 Connects via OCI Bastion Service + SSH tunnel + Wallet
 """
 
+import sys, os
+sys.path.insert(0, os.path.dirname(__file__))
+
 import asyncio
 import logging
 from mcp.server import Server
